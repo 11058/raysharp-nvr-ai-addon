@@ -1,18 +1,23 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
-# python + pip + tzdata
 RUN apk add --no-cache \
     tzdata \
     python3 \
     py3-pip
 
+# venv (обходит PEP 668)
+RUN python3 -m venv $VIRTUAL_ENV \
+ && pip install --no-cache-dir --upgrade pip setuptools wheel
+
 WORKDIR /app
 COPY requirements.txt /app/
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app /app/app
 COPY run.sh /run.sh
