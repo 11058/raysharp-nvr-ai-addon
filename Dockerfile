@@ -1,13 +1,18 @@
-ARG BUILD_FROM=ghcr.io/hassio-addons/base-python:3.12
+ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1     PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
 
-RUN apk add --no-cache tzdata
+# python + pip + tzdata
+RUN apk add --no-cache \
+    tzdata \
+    python3 \
+    py3-pip
 
 WORKDIR /app
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 COPY app /app/app
 COPY run.sh /run.sh
