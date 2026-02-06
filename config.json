@@ -1,0 +1,96 @@
+{
+  "name": "Raysharp NVR AI Bridge",
+  "slug": "raysharp_nvr_ai_bridge",
+  "description": "Bridge Raysharp/DM-470 NVR HTTP API to Home Assistant: AI (faces/plates), alarms, storage, system and more. Publishes HA events and optional state entities.",
+  "version": "0.1.0",
+  "arch": [
+    "aarch64",
+    "amd64",
+    "armv7",
+    "armhf",
+    "i386"
+  ],
+  "startup": "services",
+  "boot": "auto",
+  "init": false,
+  "options": {
+    "nvr_host": "192.168.1.100",
+    "nvr_port": 80,
+    "https": false,
+    "username": "admin",
+    "password": "",
+    "poll_interval_s": 5,
+    "lookback_s": 20,
+    "channels": [],
+    "ai": {
+      "enable": true,
+      "faces": {
+        "enable": true,
+        "alarm_groups": [],
+        "similarity_min": 70
+      },
+      "plates": {
+        "enable": true,
+        "alarm_groups": [],
+        "max_error_char_cnt": 0
+      }
+    },
+    "events": {
+      "publish_to_ha": true,
+      "event_prefix": "raysharp_nvr",
+      "publish_states": true,
+      "state_prefix": "sensor.raysharp_nvr_last"
+    },
+    "debug_log_payloads": false
+  },
+  "schema": {
+    "nvr_host": "str",
+    "nvr_port": "port",
+    "https": "bool",
+    "username": "str",
+    "password": "str",
+    "poll_interval_s": "int(1,60)",
+    "lookback_s": "int(5,300)",
+    "channels": [
+      "int"
+    ],
+    "ai": {
+      "enable": "bool",
+      "faces": {
+        "enable": "bool",
+        "alarm_groups": [
+          "int"
+        ],
+        "similarity_min": "int(0,100)"
+      },
+      "plates": {
+        "enable": "bool",
+        "alarm_groups": [
+          "int"
+        ],
+        "max_error_char_cnt": "int(0,6)"
+      }
+    },
+    "events": {
+      "publish_to_ha": "bool",
+      "event_prefix": "str",
+      "publish_states": "bool",
+      "state_prefix": "str"
+    },
+    "debug_log_payloads": "bool"
+  },
+  "ports": {
+    "8000/tcp": 8000
+  },
+  "ports_description": {
+    "8000/tcp": "HTTP API (optional; for diagnostics and raw proxy)"
+  },
+  "host_network": true,
+  "ingress": false,
+  "panel_icon": "mdi:cctv",
+  "hassio_api": true,
+  "homeassistant_api": true,
+  "map": [
+    "share:rw"
+  ]
+}
