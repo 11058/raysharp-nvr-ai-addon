@@ -2,7 +2,7 @@
   "name": "Raysharp NVR AI Bridge",
   "slug": "raysharp_nvr_ai_bridge",
   "description": "Bridge Raysharp/DM-470 NVR HTTP API to Home Assistant: AI (faces/plates), alarms, storage, system and more. Publishes HA events and optional state entities.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "arch": [
     "aarch64",
     "amd64",
