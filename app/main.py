@@ -15,21 +15,33 @@ try:
 except Exception:
     SUPERVISOR_TOKEN = None
 
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+
 def _ts_iso(sec: float) -> str:
+    # NVR API typically expects "YYYY-MM-DD HH:MM:SS"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec))
+
+
+def _cache_buster() -> str:
+    # UI uses "YYYY-MM-DD@HH:MM:SS" as query cache buster
+    return time.strftime("%Y-%m-%d@%H:%M:%S", time.localtime())
+
 
 class RawCall(BaseModel):
     method: str = Field(default="POST", description="HTTP method: GET/POST")
-    path: str = Field(description="API path, e.g. /API/System/DeviceInfo/Get")
-    json: Optional[Dict[str, Any]] = Field(default=None, description="JSON body for POST requests")
+    path: str = Field(description="API path, e.g. /API/AccountRules/Get")
+    body: Optional[Dict[str, Any]] = Field(default=None, description="JSON body for POST requests")
+
 
 @dataclass
 class AddonConfig:
     nvr_host: str
     nvr_port: int
+    api_prefix: str
+    cache_bust: bool
     https: bool
     username: str
     password: str
@@ -52,6 +64,7 @@ class AddonConfig:
     state_prefix: str
     debug_log_payloads: bool
 
+
 def load_addon_config() -> AddonConfig:
     with open("/data/options.json", "r", encoding="utf-8") as f:
         opt = json.load(f)
@@ -64,6 +77,8 @@ def load_addon_config() -> AddonConfig:
     return AddonConfig(
         nvr_host=opt["nvr_host"],
         nvr_port=int(opt.get("nvr_port", 80)),
+        api_prefix=str(opt.get("api_prefix", "/API")),
+        cache_bust=bool(opt.get("cache_bust", True)),
         https=bool(opt.get("https", False)),
         username=opt.get("username", "admin"),
         password=opt.get("password", ""),
@@ -87,31 +102,73 @@ def load_addon_config() -> AddonConfig:
         debug_log_payloads=bool(opt.get("debug_log_payloads", False)),
     )
 
+
 class NvrClient:
+    """
+    API format confirmed by browser:
+      POST http://<nvr>/API/<Module>/<Action>?YYYY-MM-DD@HH:MM:SS
+
+    Login confirmed:
+      POST /API/Web/Login
+      Digest auth challenge (WWW-Authenticate) + Set-Cookie session_<port> + X-CsrfToken
+    """
     def __init__(self, cfg: AddonConfig):
         scheme = "https" if cfg.https else "http"
         self.base = f"{scheme}://{cfg.nvr_host}:{cfg.nvr_port}"
         self.cfg = cfg
-        self.client = httpx.AsyncClient(base_url=self.base, timeout=20.0)
+
+        self._auth = httpx.DigestAuth(cfg.username, cfg.password)
+        self.client = httpx.AsyncClient(
+            base_url=self.base,
+            timeout=20.0,
+            auth=self._auth,
+            headers={"Accept": "application/json"},
+        )
+
         self.logged_in = False
-        self.session_info: Dict[str, Any] = {}
+        self.session_cookie_name: Optional[str] = None  # e.g. session_80
+        self.csrf_token: Optional[str] = None
 
     async def close(self):
         await self.client.aclose()
 
-    async def call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        method = method.upper().strip()
+    def _normalize_path(self, path: str) -> str:
+        # Allow passing "/API/..." or "API/..." or "/Web/Login" or "Web/Login"
         if not path.startswith("/"):
             path = "/" + path
 
+        # If already absolute with /API (any case), keep it.
+        if path.startswith("/API/") or path.startswith("/api/"):
+            return path
+
+        # Otherwise, treat as relative-to-prefix.
+        # If user passed "/Web/Login" -> "/API/Web/Login"
+        return self.cfg.api_prefix.rstrip("/") + path
+
+    def _with_cache_bust(self, path: str) -> str:
+        if not self.cfg.cache_bust:
+            return path
+        sep = "&" if "?" in path else "?"
+        return f"{path}{sep}{_cache_buster()}"
+
+    async def call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        method = method.upper().strip()
+        path = self._normalize_path(path)
+        url = self._with_cache_bust(path)
+
+        headers: Dict[str, str] = {}
+        if self.csrf_token:
+            headers["X-CsrfToken"] = self.csrf_token
+
         if method == "GET":
-            r = await self.client.get(path)
+            r = await self.client.get(url, headers=headers)
         else:
-            r = await self.client.post(path, json=body or {})
+            r = await self.client.post(url, json=body or {}, headers=headers)
+
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(status_code=502, detail=f"NVR non-JSON response ({r.status_code}): {r.text[:300]}")
+            data = {"_non_json": True, "status": r.status_code, "text": r.text[:2000]}
 
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail={"status": r.status_code, "data": data})
@@ -119,29 +176,32 @@ class NvrClient:
         return data
 
     async def login(self) -> None:
-        # Optional: Get info before login
-        try:
-            await self.call("POST", "/API/Login/Range", {"Action": "Get"})
-        except Exception:
-            pass
+        # POST /API/Web/Login (body in UI often empty JSON)
+        url = self._with_cache_bust(f"{self.cfg.api_prefix}/Web/Login")
+        r = await self.client.post(url, json={}, headers={"Accept": "application/json"})
 
-        payload_variants = [
-            {"UserName": self.cfg.username, "Password": self.cfg.password},
-            {"User": self.cfg.username, "PassWord": self.cfg.password},
-            {"Username": self.cfg.username, "Password": self.cfg.password},
-        ]
-        last_err = None
-        for p in payload_variants:
+        # CSRF token header (seen as X-CsrfToken)
+        csrf = r.headers.get("X-CsrfToken") or r.headers.get("x-csrftoken")
+        if csrf:
+            self.csrf_token = csrf
+
+        # session cookie (session_80, session_9000, etc.)
+        self.session_cookie_name = None
+        for c in self.client.cookies.jar:
+            if c.name.startswith("session_"):
+                self.session_cookie_name = c.name
+                break
+
+        if r.status_code >= 400:
             try:
-                resp = await self.call("POST", "/API/Login/Login", {"Action": "Login", **p})
-                self.logged_in = True
-                self.session_info = resp
-                return
-            except Exception as e:
-                last_err = e
-        self.logged_in = False
-        if last_err:
-            raise last_err
+                data = r.json()
+            except Exception:
+                data = {"text": r.text[:2000]}
+            self.logged_in = False
+            raise HTTPException(status_code=502, detail={"status": r.status_code, "data": data})
+
+        self.logged_in = True
+
 
 class HaPublisher:
     def __init__(self, cfg: AddonConfig):
@@ -168,6 +228,7 @@ class HaPublisher:
         url = f"http://supervisor/core/api/states/{entity_id}"
         body = {"state": str(state), "attributes": attributes or {}}
         await self.client.post(url, headers=self._headers(), json=body)
+
 
 class PollEngine:
     def __init__(self, cfg: AddonConfig, nvr: NvrClient, ha: HaPublisher):
@@ -240,8 +301,8 @@ class PollEngine:
             )
 
     async def _poll_faces(self, start_s: float, end_s: float) -> None:
+        # NOTE: action goes in URL, not body
         body: Dict[str, Any] = {
-            "Action": "Search",
             "StartTime": _ts_iso(start_s),
             "EndTime": _ts_iso(end_s),
         }
@@ -252,7 +313,7 @@ class PollEngine:
         if self.cfg.faces_similarity_min:
             body["Similarity"] = self.cfg.faces_similarity_min
 
-        resp = await self.nvr.call("POST", "/API/AI/SnapedFaces", body)
+        resp = await self.nvr.call("POST", "/API/AI/SnapedFaces/Search", body)
         search_id = resp.get("SearchID") or resp.get("SearchId") or resp.get("ID") or resp.get("Id")
         if not search_id:
             items = resp.get("Faces") or resp.get("Items") or resp.get("Data") or []
@@ -261,18 +322,17 @@ class PollEngine:
 
         idx = 0
         while True:
-            page = await self.nvr.call("POST", "/API/AI/SnapedFaces", {"Action": "GetByIndex", "SearchID": search_id, "Index": idx})
+            page = await self.nvr.call("POST", "/API/AI/SnapedFaces/GetByIndex", {"SearchID": search_id, "Index": idx})
             items = page.get("Faces") or page.get("Items") or page.get("Data") or []
             if not items:
                 break
             await self._emit_faces(items)
             idx += len(items)
 
-        await self.nvr.call("POST", "/API/AI/SnapedFaces", {"Action": "StopSearch", "SearchID": search_id})
+        await self.nvr.call("POST", "/API/AI/SnapedFaces/StopSearch", {"SearchID": search_id})
 
     async def _poll_plates(self, start_s: float, end_s: float) -> None:
         body: Dict[str, Any] = {
-            "Action": "SearchPlate",
             "StartTime": _ts_iso(start_s),
             "EndTime": _ts_iso(end_s),
         }
@@ -282,7 +342,7 @@ class PollEngine:
             body["AlarmGroup"] = self.cfg.plates_alarm_groups
         body["MaxErrorCharCnt"] = self.cfg.plates_max_error_char_cnt
 
-        resp = await self.nvr.call("POST", "/API/AI/SnapedObjects", body)
+        resp = await self.nvr.call("POST", "/API/AI/SnapedObjects/SearchPlate", body)
         search_id = resp.get("SearchID") or resp.get("SearchId") or resp.get("ID") or resp.get("Id")
         if not search_id:
             items = resp.get("Plates") or resp.get("Items") or resp.get("Data") or []
@@ -291,14 +351,14 @@ class PollEngine:
 
         idx = 0
         while True:
-            page = await self.nvr.call("POST", "/API/AI/SnapedObjects", {"Action": "GetByIndex", "SearchID": search_id, "Index": idx})
+            page = await self.nvr.call("POST", "/API/AI/SnapedObjects/GetByIndex", {"SearchID": search_id, "Index": idx})
             items = page.get("Plates") or page.get("Items") or page.get("Data") or []
             if not items:
                 break
             await self._emit_plates(items)
             idx += len(items)
 
-        await self.nvr.call("POST", "/API/AI/SnapedObjects", {"Action": "StopSearch", "SearchID": search_id})
+        await self.nvr.call("POST", "/API/AI/SnapedObjects/StopSearch", {"SearchID": search_id})
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -315,18 +375,22 @@ class PollEngine:
                     await self._poll_plates(start_s, end_s)
 
             except Exception as e:
-                print(f"[bridge] poll error: {e}")
+                import traceback
+                print("[bridge] poll error:", repr(e))
+                traceback.print_exc()
                 self.nvr.logged_in = False
                 await asyncio.sleep(min(10, self.cfg.poll_interval_s))
             finally:
                 await asyncio.sleep(self.cfg.poll_interval_s)
 
+
 app = FastAPI(title="Raysharp NVR AI Bridge", version="0.1.0")
 
-CFG = None
-NVR = None
-HA = None
-ENGINE = None
+CFG: Optional[AddonConfig] = None
+NVR: Optional[NvrClient] = None
+HA: Optional[HaPublisher] = None
+ENGINE: Optional[PollEngine] = None
+
 
 @app.on_event("startup")
 async def startup():
@@ -336,6 +400,7 @@ async def startup():
     HA = HaPublisher(CFG)
     ENGINE = PollEngine(CFG, NVR, HA)
     ENGINE.start()
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -347,9 +412,11 @@ async def shutdown():
     if HA:
         await HA.close()
 
+
 @app.get("/health")
 async def health():
     return {"ok": True, "logged_in": bool(getattr(NVR, "logged_in", False))}
+
 
 @app.post("/api/raw")
 async def api_raw(call: RawCall):
@@ -358,11 +425,14 @@ async def api_raw(call: RawCall):
     try:
         if not NVR.logged_in:
             await NVR.login()
-        return await NVR.call(call.method, call.path, call.json)
+        return await NVR.call(call.method, call.path, call.body)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=repr(e))
+
 
 if __name__ == "__main__":
     import uvicorn
