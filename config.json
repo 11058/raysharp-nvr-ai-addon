@@ -16,6 +16,8 @@
   "options": {
     "nvr_host": "192.168.1.100",
     "nvr_port": 80,
+    "api_prefix": "/API",
+    "cache_bust": true,
     "https": false,
     "username": "admin",
     "password": "",
@@ -44,6 +46,8 @@
     "debug_log_payloads": false
   },
   "schema": {
+    "api_prefix": "str",
+    "cache_bust": "bool",
     "nvr_host": "str",
     "nvr_port": "port",
     "https": "bool",
