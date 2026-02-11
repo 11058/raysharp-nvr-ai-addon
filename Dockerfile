@@ -11,7 +11,6 @@ RUN apk add --no-cache \
     python3 \
     py3-pip
 
-# venv (обходит PEP 668)
 RUN python3 -m venv $VIRTUAL_ENV \
  && pip install --no-cache-dir --upgrade pip setuptools wheel
 
