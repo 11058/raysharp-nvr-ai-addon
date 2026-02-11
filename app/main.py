@@ -1,8 +1,9 @@
 import asyncio
 import json
 import time
+import gzip
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -105,13 +106,19 @@ def load_addon_config() -> AddonConfig:
 
 class NvrClient:
     """
-    API format confirmed by browser:
+    API format confirmed by browser (.har):
       POST http://<nvr>/API/<Module>/<Action>?YYYY-MM-DD@HH:MM:SS
+
+    Many API endpoints expect:
+      - JSON wrapper: {"version":"1.0","data":{...}}
+      - gzip body + header Content-Encoding: gzip
 
     Login confirmed:
       POST /API/Web/Login
-      Digest auth challenge (WWW-Authenticate) + Set-Cookie session_<port> + X-CsrfToken
+      (browser sends plain JSON, not gzip)
+      Digest auth challenge + Set-Cookie session_<port> + X-CsrfToken
     """
+
     def __init__(self, cfg: AddonConfig):
         scheme = "https" if cfg.https else "http"
         self.base = f"{scheme}://{cfg.nvr_host}:{cfg.nvr_port}"
@@ -133,16 +140,14 @@ class NvrClient:
         await self.client.aclose()
 
     def _normalize_path(self, path: str) -> str:
-        # Allow passing "/API/..." or "API/..." or "/Web/Login" or "Web/Login"
         if not path.startswith("/"):
             path = "/" + path
 
-        # If already absolute with /API (any case), keep it.
+        # keep explicit /API or /api
         if path.startswith("/API/") or path.startswith("/api/"):
             return path
 
-        # Otherwise, treat as relative-to-prefix.
-        # If user passed "/Web/Login" -> "/API/Web/Login"
+        # relative -> prefix
         return self.cfg.api_prefix.rstrip("/") + path
 
     def _with_cache_bust(self, path: str) -> str:
@@ -151,24 +156,63 @@ class NvrClient:
         sep = "&" if "?" in path else "?"
         return f"{path}{sep}{_cache_buster()}"
 
-    async def call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _wrap_version_data(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        If already wrapped, keep as-is.
+        Otherwise wrap into {"version":"1.0","data": body}.
+        """
+        body = body or {}
+        if isinstance(body, dict) and "version" in body and "data" in body:
+            return body
+        return {"version": "1.0", "data": body}
+
+    @staticmethod
+    def _gzip_json(payload: Dict[str, Any]) -> bytes:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return gzip.compress(raw)
+
+    async def call(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Dict[str, Any]] = None,
+        *,
+        gzip_body: bool = True,
+        wrap_version: bool = True,
+    ) -> Dict[str, Any]:
         method = method.upper().strip()
         path = self._normalize_path(path)
         url = self._with_cache_bust(path)
 
         headers: Dict[str, str] = {}
+
+        # CSRF token (browser sends X-csrftoken)
         if self.csrf_token:
-            headers["X-CsrfToken"] = self.csrf_token
+            headers["X-csrftoken"] = self.csrf_token
 
         if method == "GET":
             r = await self.client.get(url, headers=headers)
         else:
-            r = await self.client.post(url, json=body or {}, headers=headers)
+            # For most API endpoints we mimic browser: wrap + gzip + Content-Encoding
+            payload = body or {}
+            if wrap_version:
+                payload = self._wrap_version_data(payload)
 
+            if gzip_body:
+                content = self._gzip_json(payload)
+                headers["Content-Encoding"] = "gzip"
+                headers["Content-Type"] = "application/json; charset=utf-8"
+                r = await self.client.post(url, content=content, headers=headers)
+            else:
+                headers["Content-Type"] = "application/json"
+                r = await self.client.post(url, json=payload, headers=headers)
+
+        # Parse response
         try:
             data = r.json()
         except Exception:
-            data = {"_non_json": True, "status": r.status_code, "text": r.text[:2000]}
+            data = {"_non_json": True, "status": r.status_code, "text": r.text[:4000]}
 
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail={"status": r.status_code, "data": data})
@@ -176,16 +220,22 @@ class NvrClient:
         return data
 
     async def login(self) -> None:
-        # POST /API/Web/Login (body in UI often empty JSON)
+        """
+        Browser login:
+          POST /API/Web/Login
+          Content-type: application/json (NOT gzip)
+        """
         url = self._with_cache_bust(f"{self.cfg.api_prefix}/Web/Login")
-        r = await self.client.post(url, json={}, headers={"Accept": "application/json"})
 
-        # CSRF token header (seen as X-CsrfToken)
-        csrf = r.headers.get("X-CsrfToken") or r.headers.get("x-csrftoken")
+        # IMPORTANT: do NOT wrap/gzip login, mimic browser.
+        r = await self.client.post(url, json={}, headers={"Content-Type": "application/json", "Accept": "application/json"})
+
+        # CSRF token header
+        csrf = r.headers.get("X-CsrfToken") or r.headers.get("x-csrftoken") or r.headers.get("X-csrftoken")
         if csrf:
             self.csrf_token = csrf
 
-        # session cookie (session_80, session_9000, etc.)
+        # session cookie session_<port>
         self.session_cookie_name = None
         for c in self.client.cookies.jar:
             if c.name.startswith("session_"):
@@ -196,7 +246,7 @@ class NvrClient:
             try:
                 data = r.json()
             except Exception:
-                data = {"text": r.text[:2000]}
+                data = {"text": r.text[:4000]}
             self.logged_in = False
             raise HTTPException(status_code=502, detail={"status": r.status_code, "data": data})
 
@@ -270,7 +320,7 @@ class PollEngine:
 
             payload = {"type": "face", "uid": uid, "data": it}
             if self.cfg.debug_log_payloads:
-                print("FACE:", json.dumps(payload, ensure_ascii=False)[:2000])
+                print("FACE:", json.dumps(payload, ensure_ascii=False)[:4000])
 
             await self.ha.fire_event(f"{self.cfg.event_prefix}_face", payload)
             await self.ha.set_state(
@@ -291,7 +341,7 @@ class PollEngine:
             plate = it.get("Plate") or it.get("PlateNo") or it.get("License") or ""
             payload = {"type": "plate", "uid": uid, "plate": plate, "data": it}
             if self.cfg.debug_log_payloads:
-                print("PLATE:", json.dumps(payload, ensure_ascii=False)[:2000])
+                print("PLATE:", json.dumps(payload, ensure_ascii=False)[:4000])
 
             await self.ha.fire_event(f"{self.cfg.event_prefix}_plate", payload)
             await self.ha.set_state(
@@ -301,64 +351,98 @@ class PollEngine:
             )
 
     async def _poll_faces(self, start_s: float, end_s: float) -> None:
-        # NOTE: action goes in URL, not body
-        body: Dict[str, Any] = {
+        # IMPORTANT: For this OEM most endpoints want {"version":"1.0","data":{...}} + gzip.
+        # Our NvrClient.call already wraps+gzips by default.
+        data_body: Dict[str, Any] = {
             "StartTime": _ts_iso(start_s),
             "EndTime": _ts_iso(end_s),
         }
-        if self.cfg.channels:
-            body["Chn"] = self.cfg.channels
-        if self.cfg.faces_alarm_groups:
-            body["AlarmGroup"] = self.cfg.faces_alarm_groups
-        if self.cfg.faces_similarity_min:
-            body["Similarity"] = self.cfg.faces_similarity_min
 
-        resp = await self.nvr.call("POST", "/API/AI/SnapedFaces/Search", body)
-        search_id = resp.get("SearchID") or resp.get("SearchId") or resp.get("ID") or resp.get("Id")
+        if self.cfg.channels:
+            # OEMs vary; keep list if multiple, int if single
+            if len(self.cfg.channels) == 1:
+                data_body["Chn"] = int(self.cfg.channels[0])
+            else:
+                data_body["Chn"] = [int(x) for x in self.cfg.channels]
+
+        if self.cfg.faces_alarm_groups:
+            data_body["AlarmGroup"] = [int(x) for x in self.cfg.faces_alarm_groups]
+
+        if self.cfg.faces_similarity_min is not None:
+            data_body["Similarity"] = int(self.cfg.faces_similarity_min)
+
+        # Action in URL (confirmed)
+        resp = await self.nvr.call("POST", "/API/AI/SnapedFaces/Search", data_body, gzip_body=True, wrap_version=True)
+
+        # Many endpoints return {"data":{...}}
+        data = resp.get("data", resp)
+
+        search_id = data.get("SearchID") or data.get("SearchId") or data.get("ID") or data.get("Id")
         if not search_id:
-            items = resp.get("Faces") or resp.get("Items") or resp.get("Data") or []
+            items = data.get("Faces") or data.get("Items") or data.get("Data") or []
             await self._emit_faces(items)
             return
 
         idx = 0
         while True:
-            page = await self.nvr.call("POST", "/API/AI/SnapedFaces/GetByIndex", {"SearchID": search_id, "Index": idx})
-            items = page.get("Faces") or page.get("Items") or page.get("Data") or []
+            page = await self.nvr.call(
+                "POST",
+                "/API/AI/SnapedFaces/GetByIndex",
+                {"SearchID": search_id, "Index": idx},
+                gzip_body=True,
+                wrap_version=True,
+            )
+            pdata = page.get("data", page)
+            items = pdata.get("Faces") or pdata.get("Items") or pdata.get("Data") or []
             if not items:
                 break
             await self._emit_faces(items)
             idx += len(items)
 
-        await self.nvr.call("POST", "/API/AI/SnapedFaces/StopSearch", {"SearchID": search_id})
+        await self.nvr.call("POST", "/API/AI/SnapedFaces/StopSearch", {"SearchID": search_id}, gzip_body=True, wrap_version=True)
 
     async def _poll_plates(self, start_s: float, end_s: float) -> None:
-        body: Dict[str, Any] = {
+        data_body: Dict[str, Any] = {
             "StartTime": _ts_iso(start_s),
             "EndTime": _ts_iso(end_s),
+            "MaxErrorCharCnt": int(self.cfg.plates_max_error_char_cnt),
         }
-        if self.cfg.channels:
-            body["Chn"] = self.cfg.channels
-        if self.cfg.plates_alarm_groups:
-            body["AlarmGroup"] = self.cfg.plates_alarm_groups
-        body["MaxErrorCharCnt"] = self.cfg.plates_max_error_char_cnt
 
-        resp = await self.nvr.call("POST", "/API/AI/SnapedObjects/SearchPlate", body)
-        search_id = resp.get("SearchID") or resp.get("SearchId") or resp.get("ID") or resp.get("Id")
+        if self.cfg.channels:
+            if len(self.cfg.channels) == 1:
+                data_body["Chn"] = int(self.cfg.channels[0])
+            else:
+                data_body["Chn"] = [int(x) for x in self.cfg.channels]
+
+        if self.cfg.plates_alarm_groups:
+            data_body["AlarmGroup"] = [int(x) for x in self.cfg.plates_alarm_groups]
+
+        resp = await self.nvr.call("POST", "/API/AI/SnapedObjects/SearchPlate", data_body, gzip_body=True, wrap_version=True)
+        data = resp.get("data", resp)
+
+        search_id = data.get("SearchID") or data.get("SearchId") or data.get("ID") or data.get("Id")
         if not search_id:
-            items = resp.get("Plates") or resp.get("Items") or resp.get("Data") or []
+            items = data.get("Plates") or data.get("Items") or data.get("Data") or []
             await self._emit_plates(items)
             return
 
         idx = 0
         while True:
-            page = await self.nvr.call("POST", "/API/AI/SnapedObjects/GetByIndex", {"SearchID": search_id, "Index": idx})
-            items = page.get("Plates") or page.get("Items") or page.get("Data") or []
+            page = await self.nvr.call(
+                "POST",
+                "/API/AI/SnapedObjects/GetByIndex",
+                {"SearchID": search_id, "Index": idx},
+                gzip_body=True,
+                wrap_version=True,
+            )
+            pdata = page.get("data", page)
+            items = pdata.get("Plates") or pdata.get("Items") or pdata.get("Data") or []
             if not items:
                 break
             await self._emit_plates(items)
             idx += len(items)
 
-        await self.nvr.call("POST", "/API/AI/SnapedObjects/StopSearch", {"SearchID": search_id})
+        await self.nvr.call("POST", "/API/AI/SnapedObjects/StopSearch", {"SearchID": search_id}, gzip_body=True, wrap_version=True)
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -425,6 +509,10 @@ async def api_raw(call: RawCall):
     try:
         if not NVR.logged_in:
             await NVR.login()
+
+        # For RAW: default to "API style" (wrap+gzip) unless user explicitly calls /API/Web/Login etc.
+        # If you want plain json, call path under /API/Web/... and pass body; we will still wrap by default,
+        # but you can force plain by providing body={"version":"1.0","data":...} and it will pass as-is.
         return await NVR.call(call.method, call.path, call.body)
     except HTTPException:
         raise
